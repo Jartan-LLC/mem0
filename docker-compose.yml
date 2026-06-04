@@ -1,0 +1,155 @@
+# Mem0 self-hosted — production Docker Compose (Dokploy)
+#
+# Single standalone file. No merge/override needed.
+#
+# Layout assumption:
+#   This file lives at the ROOT of the mem0 repo (github.com/mem0ai/mem0),
+#   so build contexts point into ./server and ./server/dashboard.
+#   If you instead drop it inside server/, change:
+#       ./server            -> .
+#       ./server/dashboard  -> ./dashboard
+#       ./server/init-db.sh -> ./init-db.sh
+#
+# Usage (local):  docker compose up -d --build
+# Usage (Dokploy): create a "Compose" service, point it at this repo + this
+#   file, set the env vars from .env.example in the Dokploy Environment tab,
+#   then add two domains:
+#       - one -> service "dashboard", container port 3000   (the web UI)
+#       - one -> service "mem0",      container port 8000    (browser-facing API)
+#
+# Architecture:
+#   mem0       FastAPI REST API (port 8000). Runs Alembic migrations on boot.
+#   dashboard  Next.js admin UI (port 3000). Talks to the API in-browser
+#              (NEXT_PUBLIC_API_URL) and server-side (API_INTERNAL_URL).
+#   postgres   pgvector-enabled Postgres. Holds BOTH the vector store (default
+#              db) and the app/auth db (mem0_app, created by init-db.sh).
+
+services:
+  mem0:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # Loads OPENAI_API_KEY / POSTGRES_* / model overrides / etc. from .env
+    env_file:
+      - .env
+    # Prod-critical values, guarded so a misconfig fails loudly at "up" time
+    # rather than silently at the first request. These override env_file.
+    environment:
+      - JWT_SECRET=${JWT_SECRET:?Set JWT_SECRET (openssl rand -base64 48)}
+      - AUTH_DISABLED=${AUTH_DISABLED:-false}
+      - APP_DB_NAME=${APP_DB_NAME:-mem0_app}
+      - MEM0_TELEMETRY=${MEM0_TELEMETRY:-false}
+      # CORS origin the API will accept. MUST equal the public URL where the
+      # browser loads the dashboard, or every dashboard call gets blocked.
+      - DASHBOARD_URL=${DASHBOARD_URL:?Set DASHBOARD_URL to the public dashboard origin, e.g. https://mem0.example.com}
+      # DB connection (service-internal). Defaults below match the db service.
+      - POSTGRES_HOST=${POSTGRES_HOST:-postgres}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+    # Migrate the app db, then serve. No --reload in production.
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - 8000
+    volumes:
+      # SQLite history store (HISTORY_DB_PATH=/app/history/history.db).
+      # Without this, memory history is lost on every redeploy.
+      - mem0_history:/app/history
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - default
+    healthcheck:
+      # python:3.12-slim has no curl/wget; use the bundled interpreter.
+      # /openapi.json is unauthenticated and 200 whenever the app is alive.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/openapi.json', timeout=5).status==200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+  dashboard:
+    build:
+      context: ./server/dashboard
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # Browser-side: where the user's browser reaches the API. Must be the
+      # PUBLIC API URL (the domain you point at the mem0 service in Dokploy).
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:?Set NEXT_PUBLIC_API_URL to the public API origin, e.g. https://mem0-api.example.com}
+      # Server-side: dashboard's Next server -> API over the internal network.
+      - API_INTERNAL_URL=http://mem0:8000
+      - NEXT_PUBLIC_INSTANCE_NAME=${NEXT_PUBLIC_INSTANCE_NAME:-Mem0}
+    ports:
+      - 3000
+    depends_on:
+      mem0:
+        condition: service_healthy
+    networks:
+      - default
+    healthcheck:
+      # node:20-alpine ships busybox wget.
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    shm_size: "128mb"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set for production}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Creates the mem0_app database on first init (auth/users/api-keys).
+      # The default 'postgres' db is used by pgvector for memory storage.
+      - ./server/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - default
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+volumes:
+  postgres_data:
+  mem0_history:
+
+networks:
+  default:
+    # Explicit default network ensures all services can communicate.
